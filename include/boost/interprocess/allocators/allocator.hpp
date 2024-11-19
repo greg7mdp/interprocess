@@ -142,6 +142,10 @@ class allocator
    allocator(const allocator<T2, SegmentManager> &other)
       : mp_mngr(other.get_segment_manager()){}
 
+   using occupancy_array_t = segment_manager::occupancy_array_t;
+   const occupancy_array_t& get_occupancy() const { return mp_mngr->get_occupancy(); }
+   bool initialize_occupancy() { return mp_mngr->initialize_occupancy(); }
+
    //!Allocates memory for an array of count elements.
    //!Throws boost::interprocess::bad_alloc if there is no enough memory
    pointer allocate(size_type count, cvoid_ptr hint = 0)

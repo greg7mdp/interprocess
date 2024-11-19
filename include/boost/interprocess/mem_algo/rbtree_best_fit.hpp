@@ -50,6 +50,8 @@
 // std
 #include <climits>
 #include <cstring>
+#include <cmath>
+#include <vector>
 
 //#define BOOST_INTERPROCESS_RBTREE_BEST_FIT_ABI_V1_HPP
 //to maintain ABI compatible with the original version
@@ -96,6 +98,7 @@ class rbtree_best_fit
 
    typedef typename boost::intrusive::pointer_traits<char_ptr>::difference_type difference_type;
    typedef typename boost::container::dtl::make_unsigned<difference_type>::type     size_type;
+   using occupancy_array_t = std::vector<uint8_t>;
 
    #if !defined(BOOST_INTERPROCESS_DOXYGEN_INVOKED)
 
@@ -147,6 +150,8 @@ class rbtree_best_fit
    typedef typename Imultiset::iterator                           imultiset_iterator;
    typedef typename Imultiset::const_iterator                     imultiset_const_iterator;
 
+   static constexpr size_t max_pages = 128*1024*1024; // max seg size 512 GB
+
    //!This struct includes needed data and derives from
    //!mutex_type to allow EBO when using null mutex_type
    struct header_t : public mutex_type
@@ -159,6 +164,8 @@ class rbtree_best_fit
       size_type            m_allocated;
       //!The size of the memory segment
       size_type            m_size;
+      occupancy_array_t    m_occupancy;
+      bool                 m_update_occupancy;
    }  m_header;
 
    friend class ipcdetail::memory_algorithm_common<rbtree_best_fit>;
@@ -219,6 +226,9 @@ class rbtree_best_fit
 
    //!Returns the number of free bytes of the segment
    size_type get_free_memory()  const;
+
+   const occupancy_array_t& get_occupancy() const { return m_header.m_occupancy; }
+   bool initialize_occupancy();
 
    //!Initializes to zero all the memory that's not in use.
    //!This function is normally used for security reasons.
@@ -318,6 +328,8 @@ class rbtree_best_fit
 
    //!Marks the block as allocated
    void priv_mark_as_free_block(block_ctrl *ptr);
+
+   void priv_update_occupancy(const block_ctrl *block, bool alloc);
 
    //!Checks if block has enough memory and splits/unlinks the block
    //!returning the address to the users
@@ -509,6 +521,7 @@ void rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::grow(size_type ext
                                  reinterpret_cast<char*>(new_block))/Alignment & block_ctrl::size_mask;
    BOOST_ASSERT(new_block->m_size >= BlockCtrlUnits);
    priv_mark_as_allocated_block(new_block);
+   priv_update_occupancy(new_block, true);
    BOOST_ASSERT(priv_next_block(new_block) == new_end_block);
 
    m_header.m_allocated += (size_type)new_block->m_size*Alignment;
@@ -649,13 +662,13 @@ bool rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::
          return false;
    }
 
-   //Check allocated bytes are less than size
-   if(m_header.m_allocated > m_header.m_size){
-      return false;
-   }
-
    size_type block1_off  =
       priv_first_block_offset_from_this(this, m_header.m_extra_hdr_bytes);
+
+   //Check allocated bytes are less than size
+   if(m_header.m_allocated > (m_header.m_size - block1_off)){
+      return false;
+   }
 
    //Check free bytes are less than size
    if(free_memory > (m_header.m_size - block1_off)){
@@ -1214,6 +1227,79 @@ bool rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::priv_is_prev_alloc
 }
 
 template<class MutexFamily, class VoidPointer, std::size_t MemAlignment> inline
+bool rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::initialize_occupancy()
+{
+   new (&m_header.m_occupancy) occupancy_array_t; // make sure the vector is initialized
+   assert(m_header.m_occupancy.empty());
+
+   auto mem_vis = getenv("CHAIN_MEMVIS");
+   m_header.m_update_occupancy = mem_vis && (*mem_vis == '1' || *mem_vis == 'y');
+
+   if (m_header.m_update_occupancy) {
+      // update occupancy from free blocks in m_imultiset
+      for (auto it = m_header.m_imultiset.begin(); it != m_header.m_imultiset.end(); ++it)
+         priv_update_occupancy(&*it, false);
+   }
+   return m_header.m_update_occupancy;
+}
+
+template<class MutexFamily, class VoidPointer, std::size_t MemAlignment> inline
+void rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::priv_update_occupancy(const typename rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::block_ctrl *block, bool alloc)
+{
+   if (!m_header.m_update_occupancy)
+      return;
+
+   char *ptr = (char *)block;
+   size_t sz = (size_type)block->m_size * Alignment;
+
+   constexpr size_t page_size = 4096;
+   uintptr_t offset = (uint8_t*)ptr - (uint8_t*)this;
+   size_t first_page = offset / page_size;
+   size_t last_page = (offset + sz) / page_size;
+
+   if (last_page + 1 >= m_header.m_occupancy.size()) {
+      // find the next larger number which is either a power of two, or the sum of two consecutive powers of two
+      auto find_next_larger = [](size_t x ) {
+         size_t nextPowerOfTwo = std::bit_ceil(x);
+
+         // Find the smallest sum of two consecutive powers of two >= x
+         size_t basePower = std::bit_ceil(x / 3); // Get the base power of 2 for the sum
+         size_t nextSum = 3 * basePower;
+
+         return std::min(nextPowerOfTwo, nextSum);
+      };
+
+      m_header.m_occupancy.resize(find_next_larger(last_page + 1), 255); // should be power of two
+   }
+
+   auto page_units = [](size_t bytes) {
+      assert(bytes <= page_size);
+      return (uint8_t)std::lround(((float)bytes / (float)page_size) * 255);
+   };
+
+   auto update_occupancy = [this](size_t page_idx, uint8_t units, bool alloc) {
+      if (alloc)
+         m_header.m_occupancy[page_idx] = (uint8_t)std::min((size_t)m_header.m_occupancy[page_idx] + units, (size_t)255);
+      else if (units < m_header.m_occupancy[page_idx])
+         m_header.m_occupancy[page_idx] = (uint8_t)(m_header.m_occupancy[page_idx] - units);
+      else
+         m_header.m_occupancy[page_idx] = 0;
+   };
+
+   assert(first_page <= last_page);
+   if (first_page == last_page) {
+      assert(sz < page_size);
+      update_occupancy(first_page, page_units(sz), alloc);
+   } else {
+      update_occupancy(first_page, page_units(page_size - offset % page_size), alloc);
+      for (size_t i=first_page+1; i<last_page-1; ++i) {
+         update_occupancy(i, page_units(page_size), alloc);
+      }
+      update_occupancy(last_page, page_units(offset % page_size), alloc);
+   }
+}
+
+template<class MutexFamily, class VoidPointer, std::size_t MemAlignment> inline
 void rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::priv_mark_as_allocated_block
       (typename rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::block_ctrl *block)
 {
@@ -1276,6 +1362,7 @@ void* rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::priv_check_and_al
 
    //Mark the block as allocated
    priv_mark_as_allocated_block(block);
+   priv_update_occupancy(block, true);
 
    //Clear the memory occupied by the tree hook, since this won't be
    //cleared with zero_free_memory
@@ -1306,6 +1393,8 @@ void rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::priv_deallocate(vo
    if(!addr)   return;
 
    block_ctrl *block = priv_get_block(addr);
+
+   priv_update_occupancy(block, false);
 
    //The blocks must be marked as allocated and the sizes must be equal
    BOOST_ASSERT(priv_is_allocated_block(block));

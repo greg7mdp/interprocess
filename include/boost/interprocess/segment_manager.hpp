@@ -184,6 +184,10 @@ class segment_manager_base
 
    #endif   //#ifndef BOOST_INTERPROCESS_DOXYGEN_INVOKED
 
+   using occupancy_array_t = MemoryAlgorithm::occupancy_array_t;
+   const occupancy_array_t& get_occupancy() const { return MemoryAlgorithm::get_occupancy(); }
+   bool initialize_occupancy() { return MemoryAlgorithm::initialize_occupancy(); }
+
    //!Allocates nbytes bytes. Throws boost::interprocess::bad_alloc
    //!on failure
    void * allocate(size_type nbytes)
