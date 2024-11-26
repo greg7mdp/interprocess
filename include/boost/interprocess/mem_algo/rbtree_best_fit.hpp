@@ -52,6 +52,10 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <unordered_map>
+#include <map>
+#include <array>
+#include <iostream>
 
 //#define BOOST_INTERPROCESS_RBTREE_BEST_FIT_ABI_V1_HPP
 //to maintain ABI compatible with the original version
@@ -166,6 +170,9 @@ class rbtree_best_fit
       size_type            m_size;
       occupancy_array_t    m_occupancy;
       bool                 m_update_occupancy;
+      std::unordered_map<size_t, size_t> m_allocs;
+      std::unordered_map<size_t, size_t> m_deallocs;
+      std::unordered_map<void *, size_t> m_alloc_addrs;
    }  m_header;
 
    friend class ipcdetail::memory_algorithm_common<rbtree_best_fit>;
@@ -686,7 +693,41 @@ inline void* rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::
    //-----------------------
    size_type ignore_recvd = nbytes;
    void *ignore_reuse = 0;
-   return priv_allocate(boost::interprocess::allocate_new, nbytes, ignore_recvd, ignore_reuse);
+   void *res = priv_allocate(boost::interprocess::allocate_new, nbytes, ignore_recvd, ignore_reuse);
+   auto c = nbytes > 512 ? std::bit_ceil(nbytes) : (nbytes > 64 ? (nbytes + 7) & ~0x7 : nbytes);
+   m_header.m_alloc_addrs[res] = c;
+   m_header.m_allocs[c]++;
+   bool doit = false;
+   if (doit) {
+      std::map<size_t, std::array<size_t, 4>> s;
+
+      size_t total_allocs = 0, total_deallocs = 0;
+      std::cout << "allocations:" << '\n';
+      for (const auto& [sz, alloc] : m_header.m_allocs) {
+         auto dealloc = m_header.m_deallocs[sz];
+         size_t allocated = sz * alloc;
+         size_t freed = sz * dealloc;
+
+         s.emplace(sz, std::array<size_t, 4>{alloc, dealloc, allocated, freed});
+         
+         total_allocs   += allocated;
+         total_deallocs += freed;
+      }
+      std::cout.imbue(std::locale(""));
+      
+      for (const auto& [sz, p] : s) {
+         if (sz > 512)
+            std::cout << " | " << (sz/2)+1 << "-" << sz << " | " << p[0] << " | " << p[1] << " | " << p[2] << " | " << p[3] <<  " |\n";
+         else if (sz > 64)
+            std::cout << " | " << sz-7 << "-" << sz << " | " << p[0] << " | " << p[1] << " | " << p[2] << " | " << p[3] <<  " |\n";
+         else
+            std::cout << " | " << sz << " | " << p[0] << " | " << p[1] << " | " << p[2] << " | " << p[3] <<  " |\n";
+      }
+
+      std::cout << "**total allocs**:  " << total_allocs << " bytes" << "\n";
+      std::cout << "**total deallocs**:  " << total_deallocs << " bytes" << "\n";
+   }
+   return res;
 }
 
 template<class MutexFamily, class VoidPointer, std::size_t MemAlignment>
@@ -1230,6 +1271,9 @@ template<class MutexFamily, class VoidPointer, std::size_t MemAlignment> inline
 bool rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::initialize_occupancy()
 {
    new (&m_header.m_occupancy) occupancy_array_t; // make sure the vector is initialized
+   new (&m_header.m_allocs) std::unordered_map<size_t, size_t>();
+   new (&m_header.m_alloc_addrs) std::unordered_map<void *, size_t>();
+   new (&m_header.m_deallocs) std::unordered_map<size_t, size_t>();
    assert(m_header.m_occupancy.empty());
 
    auto mem_vis = getenv("CHAIN_MEMVIS");
@@ -1384,6 +1428,9 @@ void rbtree_best_fit<MutexFamily, VoidPointer, MemAlignment>::deallocate(void* a
    //-----------------------
    boost::interprocess::scoped_lock<mutex_type> guard(m_header);
    //-----------------------
+   size_t nbytes = m_header.m_alloc_addrs[addr];
+   m_header.m_deallocs[nbytes]++;
+   m_header.m_alloc_addrs.erase(addr);
    return this->priv_deallocate(addr);
 }
 
